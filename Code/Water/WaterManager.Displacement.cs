@@ -124,14 +124,16 @@ public partial class WaterManager
 		WaterQuad quad = FindQuadAtPosition(position);
 		WaterBody body = FindBodyAtPosition(position);
 
+		Vector3 disp;
 		if (quad.IsValid() && body.IsValid())
-			return quad.GetWaveHeightAt(position) >= body.GetWaveHeightAt(position)
+			disp = quad.GetWaveHeightAt(position) >= body.GetWaveHeightAt(position)
 				? quad.GetWaveDisplacementAt(position)
 				: body.GetWaveDisplacementAt(position);
+		else if (quad.IsValid()) disp = quad.GetWaveDisplacementAt(position);
+		else if (body.IsValid()) disp = body.GetWaveDisplacementAt(position);
+		else return Vector3.Zero;
 
-		if (quad.IsValid()) return quad.GetWaveDisplacementAt(position);
-		if (body.IsValid()) return body.GetWaveDisplacementAt(position);
-		return Vector3.Zero;
+		return disp * WaterShoreDamping.ShoreFactor(Current?.Scene, position, GetFlatWaterHeightAt(position));
 	}
 
 	public static Vector3 GetWaveVelocityAt(Vector3 position)
@@ -167,11 +169,16 @@ public partial class WaterManager
 		WaterQuad quad = FindQuadAtPosition(position);
 		WaterBody body = FindBodyAtPosition(position);
 
+		float raw;
 		if (quad.IsValid() && body.IsValid())
-			return MathF.Max(quad.GetWaveHeightAt(position), body.GetWaveHeightAt(position));
+			raw = MathF.Max(quad.GetWaveHeightAt(position), body.GetWaveHeightAt(position));
+		else if (quad.IsValid()) raw = quad.GetWaveHeightAt(position);
+		else if (body.IsValid()) raw = body.GetWaveHeightAt(position);
+		else return float.MinValue;
 
-		if (quad.IsValid()) return quad.GetWaveHeightAt(position);
-		if (body.IsValid()) return body.GetWaveHeightAt(position);
-		return float.MinValue;
+		// Damp the wave portion near shore so the surface buoyancy uses matches the visuals.
+		float flat = GetFlatWaterHeightAt(position);
+		float factor = WaterShoreDamping.ShoreFactor(Current?.Scene, position, flat);
+		return flat + (raw - flat) * factor;
 	}
 }
