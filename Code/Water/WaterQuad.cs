@@ -533,6 +533,8 @@ public sealed class WaterQuad : Component, Component.ExecuteInEditor, Component.
 		if (profile.IsValid())
 			profile.ApplyTo(m_DrawAttributes);
 
+		WaterShoreDamping.Apply(Scene, m_DrawAttributes);
+
 		m_DrawAttributes.Set("WaterTime", Time.Now);
 		m_DrawAttributes.Set("DepthMax", Depth);
 

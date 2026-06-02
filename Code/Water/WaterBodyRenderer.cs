@@ -197,6 +197,8 @@ public sealed class WaterBodyRenderer : Component, Component.ExecuteInEditor, Co
 		if (profile.IsValid())
 			profile.ApplyTo(m_DrawAttributes);
 
+		WaterShoreDamping.Apply(Scene, m_DrawAttributes);
+
 		m_DrawAttributes.Set("WaterTime", Time.Now);
 		m_DrawAttributes.Set("DepthMax", Depth);
 

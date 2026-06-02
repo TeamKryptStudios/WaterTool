@@ -73,6 +73,17 @@ VS
 
 	float g_flWaterTime < Attribute("WaterTime"); Default1(0); >;
 
+	// Shore wave damping — terrain heightmap fed by WaterShoreDamping (0 range = disabled)
+	Texture2D g_tTerrainHeightMap < Attribute("TerrainHeightMap"); SrgbRead(false); >;
+	SamplerState g_sShoreSampler < Filter(Bilinear); AddressU(Clamp); AddressV(Clamp); >;
+	float2 g_vTerrainWorldMin < Attribute("TerrainWorldMin"); Default2(0, 0); >;
+	float g_flTerrainSize < Attribute("TerrainSize"); Default1(0); >;
+	float g_flTerrainHeightScale < Attribute("TerrainHeightScale"); Default1(0); >;
+	float g_flTerrainBaseZ < Attribute("TerrainBaseZ"); Default1(0); >;
+	float g_flShoreWaveRange < Attribute("ShoreWaveRange"); Default1(0); >;
+	float g_flDeepWaveBoost < Attribute("DeepWaveBoost"); Default1(1); >;
+	float g_flDeepWaveRange < Attribute("DeepWaveRange"); Default1(0); >;
+
 	// Gerstner wave sum (Identical formula to C# ComputeGerstner for exact CPU/GPU match.)
 	// Returns float3: (dx, dy, dz) displacement. XY = horizontal orbital motion, Z = vertical.
 	float3 ComputeGerstner(float2 worldXY, float scale, float speed, float2 dir, int octaves, float lacunarity, float persistence, float steepness, float time)
@@ -136,8 +147,28 @@ VS
         // Swell waves
         float3 swellDisp = ComputeGerstner(worldXY, g_flSwellScale, g_flSwellSpeed, g_vSwellDirection, g_nSwellOctaves, g_flSwellLacunarity, g_flSwellPersistence, g_flSwellSteepness, g_flWaterTime) * g_flSwellIntensity;
 
+		// Damp waves in shallow water near the shoreline (terrain heightmap).
+		float shoreFactor = 1.0;
+		if ( g_flShoreWaveRange > 0.0 && g_flTerrainSize > 0.0 )
+		{
+			float2 raw = ( worldXY - g_vTerrainWorldMin ) / g_flTerrainSize;
+			float2 tuv = saturate( raw );
+			float th = g_tTerrainHeightMap.SampleLevel( g_sShoreSampler, tuv, 0 ).r;
+			float terrainZ = g_flTerrainBaseZ + th * g_flTerrainHeightScale;
+			float localDepth = i.vPositionWs.z - terrainZ;
+			float baseFactor = smoothstep( 0.0, g_flShoreWaveRange, localDepth );
+			float deep = g_flDeepWaveRange > 0.0 ? saturate( ( localDepth - g_flShoreWaveRange ) / g_flDeepWaveRange ) : 0.0;
+			float depthFactor = baseFactor + deep * ( g_flDeepWaveBoost - 1.0 );
+
+			// Outside the terrain bounds = open deep water (full waves + boost). Blend the
+			// depth-based damping toward that over a small edge margin so there's no seam.
+			float inside = min( min( raw.x, 1.0 - raw.x ), min( raw.y, 1.0 - raw.y ) );
+			float edgeBlend = saturate( inside / 0.03 );
+			shoreFactor = lerp( g_flDeepWaveBoost, depthFactor, edgeBlend );
+		}
+
 		// Apply full XY + Z displacement (XY creates the orbital Gerstner motion)
-		i.vPositionWs.xyz += detailDisp + swellDisp;
+		i.vPositionWs.xyz += ( detailDisp + swellDisp ) * shoreFactor;
 		i.vPositionPs.xyzw = Position3WsToPs(i.vPositionWs.xyz);
 
 		return FinalizeVertex(i);

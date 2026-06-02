@@ -1,5 +1,5 @@
 {
-  "WavesIntensity": 4,
+  "WavesIntensity": 10,
   "WavesSpeed": 2,
   "WavesScale": 0.05,
   "WavesDirection": "1,0.5",
@@ -7,7 +7,7 @@
   "WavesLacunarity": 2,
   "WavesPersistence": 0.5,
   "WavesSteepness": 0.5,
-  "SwellIntensity": 50,
+  "SwellIntensity": 110,
   "SwellSpeed": 400,
   "SwellScale": 0.002,
   "SwellDirection": "0.699999988,0.300000012",
