@@ -22,13 +22,12 @@ public sealed class WaterQuad : Component, Component.ExecuteInEditor, Component.
 
 	#pragma warning restore CS0649
 
-	// GPU buffers (per-quad, owned here — WaterQuadManager owns SceneCustomObject and ComputeShader)
+	// GPU buffers (per-quad, owned here — WaterManager owns the command lists and ComputeShader)
 	private GpuBuffer<WaterVertex> m_VertexBuffer;
 	private GpuBuffer<uint> m_IndexBuffer;
 	private int m_TotalIndexCount;
-	private readonly RenderAttributes m_DrawAttributes = new RenderAttributes();
-	private CommandList m_CommandList;
-	private Texture m_CachedFrameBufferCopy;
+	private int m_CircleGridWidth = 1;
+	private readonly RenderAttributes m_DrawAttributes = new();
 	private GpuBuffer<Vector4> m_WaterExclusionVolumeBuffer;
 	private readonly Vector4[] m_WaterExclusionVolumeData = new Vector4[MAX_WATER_EXCLUSION_VOLUMES * WATER_EXCLUSION_VOLUME_ROWS];
 	private GpuBuffer<Vector4> m_HullExclusionBuffer;
@@ -184,13 +183,6 @@ public sealed class WaterQuad : Component, Component.ExecuteInEditor, Component.
 			Gizmo.Draw.LineBBox(m_HullCollider.LocalBounds);
 		}
 	}
-	
-	
-	
-	public void CacheCommandList(CommandList _CommandList)
-	{
-		m_CommandList ??= _CommandList;
-	}
 
 
 
@@ -295,24 +287,58 @@ public sealed class WaterQuad : Component, Component.ExecuteInEditor, Component.
 
 	private void BuildCircleBuffers()
 	{
-		int N = CircleSegments;
+		float radius = MathF.Min(Width, Length) / 2.0f;
+		int M = ComputeCircleGridWidth();
+		m_CircleGridWidth = M;
 
-		// center + N edge points
-		m_VertexBuffer = new GpuBuffer<WaterVertex>(N + 1, GpuBuffer.UsageFlags.Vertex | GpuBuffer.UsageFlags.Structured);
+		float cellSize = (radius * 2.0f) / M;   // M cells span the full diameter
+		float half = M * cellSize * 0.5f;        // == radius (grid centred on the circle)
+		float r2 = radius * radius;
 
-		// N pizza-slice triangles: [center, edge[i], edge[i+1]], wrapping last back to edge[1]
-		var indices = new List<uint>(N * 3);
+		// "Minecraft circle": a uniform, world-axis-aligned grid of square cells, masked
+		// to a circular boundary. Because the vertices live on the same grid as a
+		// rectangular quad, wave displacement behaves identically (no polar pinching).
+		int verticesPerSide = M + 1;
+		int vertexCount = verticesPerSide * verticesPerSide;
+		m_VertexBuffer = new GpuBuffer<WaterVertex>(vertexCount, GpuBuffer.UsageFlags.Vertex | GpuBuffer.UsageFlags.Structured);
 
-		for (int i = 0; i < N; i++)
+		var indices = new List<uint>();
+
+		// Emit a cell's two triangles only when its centre falls inside the circle
+		for (int y = 0; y < M; y++)
 		{
-			indices.Add(0);
-			indices.Add((uint)(i + 1));
-			indices.Add((uint)((i + 1) % N + 1));
+			for (int x = 0; x < M; x++)
+			{
+				float cx = (x + 0.5f) * cellSize - half;
+				float cy = (y + 0.5f) * cellSize - half;
+
+				if (cx * cx + cy * cy > r2)
+					continue;
+
+				uint i0 = (uint)(y * verticesPerSide + x);
+				uint i1 = i0 + 1;
+				uint i2 = i0 + (uint)verticesPerSide;
+				uint i3 = i2 + 1;
+
+				indices.Add(i0); indices.Add(i1); indices.Add(i2);
+				indices.Add(i1); indices.Add(i3); indices.Add(i2);
+			}
 		}
 
 		m_IndexBuffer = new GpuBuffer<uint>(indices.Count, GpuBuffer.UsageFlags.Index | GpuBuffer.UsageFlags.Structured);
 		m_IndexBuffer.SetData(indices);
 		m_TotalIndexCount = indices.Count;
+	}
+
+
+
+	// Number of grid cells across the circle's diameter, driven by BaseCellSize so the
+	// blockiness matches the rest of the water — smaller cells = finer (rounder) edge.
+	private int ComputeCircleGridWidth()
+	{
+		float diameter = MathF.Min(Width, Length);
+		int cells = (int)MathF.Ceiling(diameter / BaseCellSize);
+		return Math.Clamp(cells, 1, 256);
 	}
 
 
@@ -386,7 +412,9 @@ public sealed class WaterQuad : Component, Component.ExecuteInEditor, Component.
 
 
 
-	internal void DispatchCompute(ComputeShader _Shader, Vector3 _CameraPosition)
+	// Records the clipmap compute dispatches into the command list as DEFERRED commands -
+	// see WaterBodyRenderer.RecordCompute for why per-ring attributes go through the list.
+	internal void RecordCompute(CommandList _CommandList, ComputeShader _Shader, Vector3 _CameraPosition)
 	{
 		if (!ParticipatesInRendering || !HasValidBuffers)
 			return;
@@ -395,23 +423,24 @@ public sealed class WaterQuad : Component, Component.ExecuteInEditor, Component.
 
 		if (CircleShape)
 		{
-			float radius = MathF.Min(Width, Length) / 2.0f;
+			int M = m_CircleGridWidth;
+			int verticesPerSide = M + 1;
+			float cellSize = MathF.Min(Width, Length) / M;   // M cells span the diameter
 
-			_Shader.Attributes.Set("DiscMode", true);
+			_CommandList.Attributes.Set("VertexBuffer", m_VertexBuffer);
+			_CommandList.Attributes.Set("VertexOffset", 0);
 
-			_Shader.Attributes.Set("VertexBuffer", m_VertexBuffer);
-			_Shader.Attributes.Set("VertexOffset", 0);
+			_CommandList.Attributes.Set("GridWidth", M);
+			_CommandList.Attributes.Set("CellSize", cellSize);
 
-			_Shader.Attributes.Set("WaterZ", WorldPosition.z);
+			// Static grid centred on the quad — the circular pool doesn't follow the camera
+			_CommandList.Attributes.Set("SnapPosition", (Vector2)WorldPosition);
+			_CommandList.Attributes.Set("WaterZ", WorldPosition.z);
 
-			_Shader.Attributes.Set("TilingScale", 1.0f / outerExtent);
-			_Shader.Attributes.Set("ClampToBounds", false);
+			_CommandList.Attributes.Set("TilingScale", 1.0f / outerExtent);
+			_CommandList.Attributes.Set("ClampToBounds", false);
 
-			_Shader.Attributes.Set("CircleSegments", CircleSegments);
-			_Shader.Attributes.Set("CircleCenter", (Vector2)WorldPosition);
-			_Shader.Attributes.Set("CircleRadius", radius);
-
-			_Shader.Dispatch(CircleSegments + 1, 1, 1);
+			_CommandList.DispatchCompute(_Shader, verticesPerSide * verticesPerSide, 1, 1);
 
 			return;
 		}
@@ -434,45 +463,41 @@ public sealed class WaterQuad : Component, Component.ExecuteInEditor, Component.
 			float snapX = MathF.Floor(clipmapAnchor.x / cellSize) * cellSize;
 			float snapY = MathF.Floor(clipmapAnchor.y / cellSize) * cellSize;
 
-			_Shader.Attributes.Set("DiscMode", false);
+			_CommandList.Attributes.Set("VertexBuffer", m_VertexBuffer);
+			_CommandList.Attributes.Set("VertexOffset", ring * verticesPerRing);
 
-			_Shader.Attributes.Set("VertexBuffer", m_VertexBuffer);
-			_Shader.Attributes.Set("VertexOffset", ring * verticesPerRing);
+			_CommandList.Attributes.Set("GridWidth", CellsPerRing);
+			_CommandList.Attributes.Set("CellSize", cellSize);
 
-			_Shader.Attributes.Set("GridWidth", CellsPerRing);
-			_Shader.Attributes.Set("CellSize", cellSize);
+			_CommandList.Attributes.Set("SnapPosition", new Vector2(snapX, snapY));
+			_CommandList.Attributes.Set("WaterZ", WorldPosition.z);
 
-			_Shader.Attributes.Set("SnapPosition", new Vector2(snapX, snapY));
-			_Shader.Attributes.Set("WaterZ", WorldPosition.z);
+			_CommandList.Attributes.Set("TilingScale", 1.0f / outerExtent);
+			_CommandList.Attributes.Set("ClampToBounds", true);
 
-			_Shader.Attributes.Set("TilingScale", 1.0f / outerExtent);
-			_Shader.Attributes.Set("ClampToBounds", true);
+			_CommandList.Attributes.Set("BoundsMin", new Vector2(boundsMinX, boundsMinY));
+			_CommandList.Attributes.Set("BoundsMax", new Vector2(boundsMaxX, boundsMaxY));
 
-			_Shader.Attributes.Set("BoundsMin", new Vector2(boundsMinX, boundsMinY));
-			_Shader.Attributes.Set("BoundsMax", new Vector2(boundsMaxX, boundsMaxY));
-
-			_Shader.Dispatch(verticesPerRing, 1, 1);
+			_CommandList.DispatchCompute(_Shader, verticesPerRing, 1, 1);
 		}
 	}
 
 
 
-	internal void BarrierTransition()
+	internal void BarrierTransition(CommandList _CommandList)
 	{
 		if (m_VertexBuffer.IsValid())
-			m_CommandList.ResourceBarrierTransition(m_VertexBuffer, ResourceState.UnorderedAccess, ResourceState.VertexOrIndexBuffer);
+			_CommandList?.ResourceBarrierTransition(m_VertexBuffer, ResourceState.UnorderedAccess, ResourceState.VertexOrIndexBuffer);
 	}
 
 
 
-	internal void Draw(Texture _FrameBufferCopy)
+	internal void Draw(CommandList _CommandList)
 	{
 		if (!ParticipatesInRendering || !HasValidBuffers)
 			return;
-
-		m_CachedFrameBufferCopy = _FrameBufferCopy;
-
-		m_CommandList.DrawIndexed(m_VertexBuffer, m_IndexBuffer, Material, 0, m_TotalIndexCount, m_DrawAttributes);
+		
+		_CommandList?.DrawIndexed(m_VertexBuffer, m_IndexBuffer, Material, 0, m_TotalIndexCount, m_DrawAttributes);
 	}
 
 
@@ -523,9 +548,6 @@ public sealed class WaterQuad : Component, Component.ExecuteInEditor, Component.
 
 	private void UpdateShaderAttributes()
 	{
-		if (m_CachedFrameBufferCopy.IsValid())
-			m_DrawAttributes.Set("FrameBufferCopyTexture", m_CachedFrameBufferCopy);
-
 		m_DrawAttributes.Set("RequireWaterInclusionVolumes", false);
 
 		WaterDefinition profile = WaterManager.GetWaveProfile(WaterType);
@@ -543,6 +565,12 @@ public sealed class WaterQuad : Component, Component.ExecuteInEditor, Component.
 		Vector2 tiling = new Vector2((outerExtent / BASE_TILE_SIZE) * TextureTilingMultiplier, (outerExtent / BASE_TILE_SIZE) * TextureTilingMultiplier);
 
 		m_DrawAttributes.Set("NormalTiling", tiling);
+
+		WaterManager.Current?.ApplyRippleAttributes(m_DrawAttributes);
+
+		// Band-limit the wave normal to the local clipmap vertex spacing (see shader)
+		m_DrawAttributes.Set("WaveNormalEpsScale", 3.0f / CellsPerRing);
+		m_DrawAttributes.Set("WaveNormalEpsMin", BaseCellSize);
 
 		SetWaterExclusionVolumes(Scene.Camera.WorldPosition);
 		SetHullExclusionVolumes();

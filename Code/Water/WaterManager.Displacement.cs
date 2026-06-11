@@ -46,19 +46,27 @@ public partial class WaterManager
 			
 			var local = quad.HullCollider.WorldTransform.PointToLocal(position);
 			bool insideXY;
+			float floorLocalZ;
 
 			if (quad.HullCollider.Type == HullCollider.PrimitiveType.Cylinder)
 			{
 				Vector2 flat = new(local.x, local.y);
 				insideXY = flat.LengthSquared <= quad.HullCollider.Radius * quad.HullCollider.Radius;
+				floorLocalZ = quad.HullCollider.Center.z - quad.HullCollider.Height * 0.5f;
 			}
 			else
 			{
 				Vector3 half = quad.HullCollider.BoxSize * 0.5f;
 				insideXY = MathF.Abs(local.x) <= half.x && MathF.Abs(local.y) <= half.y;
+				floorLocalZ = quad.HullCollider.Center.z - half.z;
 			}
 
 			if (!insideXY)
+				continue;
+
+			// Water has a finite depth: ignore the quad once we're beneath its floor so the
+			// column isn't treated as bottomless (otherwise swim/buoyancy stay "submerged" forever).
+			if (local.z < floorLocalZ)
 				continue;
 
 			float dist = MathF.Abs(position.z - quad.WorldPosition.z);
@@ -76,6 +84,10 @@ public partial class WaterManager
 		foreach (WaterBody body in Current?.Bodies ?? [])
 		{
 			if (!body.IsValid() || !body.Active || !body.ContainsPointXY(position))
+				continue;
+
+			// Finite depth: skip bodies whose floor is above us (we're below the volume).
+			if (position.z < body.GetBottomHeight())
 				continue;
 
 			float dist = body.GetVerticalDistanceToSurface(position);
@@ -124,16 +136,22 @@ public partial class WaterManager
 		WaterQuad quad = FindQuadAtPosition(position);
 		WaterBody body = FindBodyAtPosition(position);
 
-		Vector3 disp;
+		Vector3 displacement;
 		if (quad.IsValid() && body.IsValid())
-			disp = quad.GetWaveHeightAt(position) >= body.GetWaveHeightAt(position)
+			displacement = quad.GetWaveHeightAt(position) >= body.GetWaveHeightAt(position)
 				? quad.GetWaveDisplacementAt(position)
 				: body.GetWaveDisplacementAt(position);
-		else if (quad.IsValid()) disp = quad.GetWaveDisplacementAt(position);
-		else if (body.IsValid()) disp = body.GetWaveDisplacementAt(position);
+		else if (quad.IsValid()) displacement = quad.GetWaveDisplacementAt(position);
+		else if (body.IsValid()) displacement = body.GetWaveDisplacementAt(position);
 		else return Vector3.Zero;
 
-		return disp * WaterShoreDamping.ShoreFactor(Current?.Scene, position, GetFlatWaterHeightAt(position));
+		// Damp the base waves near shore so the visuals + physics match the shoreline.
+		displacement *= WaterShoreDamping.ShoreFactor(Current?.Scene, position, GetFlatWaterHeightAt(position));
+
+		// Interactive ripples add purely vertical displacement on top (not shore-damped).
+		displacement.z += Current?.ComputeRippleHeight((Vector2)position) ?? 0.0f;
+
+		return displacement;
 	}
 
 	public static Vector3 GetWaveVelocityAt(Vector3 position)
@@ -176,9 +194,12 @@ public partial class WaterManager
 		else if (body.IsValid()) raw = body.GetWaveHeightAt(position);
 		else return float.MinValue;
 
-		// Damp the wave portion near shore so the surface buoyancy uses matches the visuals.
+		// Damp the wave portion near shore so the surface buoyancy matches the visuals.
 		float flat = GetFlatWaterHeightAt(position);
 		float factor = WaterShoreDamping.ShoreFactor(Current?.Scene, position, flat);
-		return flat + (raw - flat) * factor;
+		float damped = flat + (raw - flat) * factor;
+
+		// Interactive ripples raise/lower the effective surface so physics tracks the visual.
+		return damped + (Current?.ComputeRippleHeight((Vector2)position) ?? 0.0f);
 	}
 }
